@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>EcoRoute Demo (Click to Select)</title>
+  <script src="https://maps.googleapis.com/maps/api/js?key={{ gmaps_key }}"></script>
+  <style>
+    body { margin:0; font-family: Arial, sans-serif; }
+    #map { height: 80vh; width: 100vw; }
+    #controls { padding:10px; background:#fff; }
+    #controls button { margin-right: 10px; }
+    #list { margin-top:8px; }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <button id="mode-source">Select Source</button>
+    <button id="mode-dest" disabled>Select Destinations</button>
+    <button id="go" disabled>Calculate Eco Route</button>
+    <div id="list">
+      <strong>Source:</strong> <span id="source-coord">None</span><br>
+      <strong>Destinations:</strong>
+      <ul id="dest-list"></ul>
+    </div>
+  </div>
+  <div id="map"></div>
+
+  <script>
+    let map, mode = 'source';
+    let sourceMarker = null, destMarkers = [];
+    let sourceCoord = null, destCoords = [];
+
+    function initMap() {
+      map = new google.maps.Map(document.getElementById("map"), {
+        center: { lat:20.5937, lng:78.9629 }, zoom:5
+      });
+
+      map.addListener('click', (e) => {
+        const { latLng } = e;
+        if (mode === 'source') {
+          // Clear old source
+          if (sourceMarker) sourceMarker.setMap(null);
+          sourceCoord = { lat: latLng.lat(), lng: latLng.lng() };
+          sourceMarker = new google.maps.Marker({
+            position: sourceCoord,
+            map, label: 'S'
+          });
+          document.getElementById('source-coord').innerText =
+            sourceCoord.lat.toFixed(5) + ', ' + sourceCoord.lng.toFixed(5);
+          // Enable destination mode
+          document.getElementById('mode-dest').disabled = false;
+          document.getElementById('mode-source').disabled = true;
+          mode = 'dest';
+        } else {
+          // Add a destination marker
+          const coord = { lat: latLng.lat(), lng: latLng.lng() };
+          destCoords.push(coord);
+          const m = new google.maps.Marker({
+            position: coord,
+            map, label: `${destCoords.length}`
+          });
+          destMarkers.push(m);
+          const li = document.createElement('li');
+          li.innerText = coord.lat.toFixed(5) + ', ' + coord.lng.toFixed(5);
+          document.getElementById('dest-list').appendChild(li);
+          // Enable calculate button
+          if (destCoords.length) document.getElementById('go').disabled = false;
+        }
+      });
+    }
+
+    document.getElementById('mode-source')
+      .addEventListener('click', () => {
+        mode = 'source';
+      });
+    document.getElementById('mode-dest')
+      .addEventListener('click', () => {
+        mode = 'dest';
+      });
+
+    document.getElementById('go').addEventListener('click', async () => {
+      if (!sourceCoord || destCoords.length === 0) return;
+      const resp = await fetch("{{ api_url }}", {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({
+          source: sourceCoord,
+          destinations: destCoords
+        })
+      });
+      const route = await resp.json();
+      if (!route.length) { alert("No route"); return; }
+
+      // Draw route
+      const waypts = route.slice(1,-1).map(p => ({
+        location: p.lat + "," + p.lng, stopover: true
+      }));
+      new google.maps.DirectionsService().route({
+        origin:      route[0].lat + "," + route[0].lng,
+        destination: route[route.length-1].lat + "," + route[route.length-1].lng,
+        waypoints:   waypts,
+        travelMode:  'DRIVING',
+        optimizeWaypoints: false
+      }, (res, st) => {
+        if (st === "OK") {
+          new google.maps.DirectionsRenderer({
+            map,
+            suppressMarkers: true,
+            polylineOptions: { strokeColor: "#009900" }
+          }).setDirections(res);
+        } else {
+          alert("Directions failed: " + st);
+        }
+      });
+    });
+
+    window.onload = initMap;
+  </script>
+</body>
+</html>

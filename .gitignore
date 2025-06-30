@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+
+# Virtual environment
+venv/
+ENV/
+env/
+.venv/
+
+# Environment variables
+.env
+
+# Logs and temp
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Byte-compiled / optimized / DLL files
+*.so
+*.dll
+
+# IDEs/editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# PyCharm and VSCode settings
+*.iml
+*.code-workspace

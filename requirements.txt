@@ -1,0 +1,7 @@
+Flask
+python-dotenv
+requests
+numpy
+scikit-learn
+ortools
+polyline
