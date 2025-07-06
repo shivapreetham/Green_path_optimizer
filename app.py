@@ -1,4 +1,4 @@
-import os, time, requests, numpy as np, polyline
+import os, time, requests, numpy as np, polyline, json
 from flask import Flask, request, jsonify, render_template
 from dotenv import load_dotenv
 from sklearn.cluster import DBSCAN
@@ -9,25 +9,26 @@ import pyproj
 import aiohttp
 import asyncio
 from haversine import haversine
-
+import redis
 
 # Load .env
 load_dotenv()
 
-GOOGLE_API_KEY      = os.getenv("GOOGLE_API_KEY")
-# OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_TTL = 86400  # 1 day
 
 EMISSION_RATES = {"EV":0, "Petrol":120, "Diesel":180}
 WEIGHTS        = {"aqi":0.4, "zones":0.3, "emissions":0.2, "time":0.1}
 
 app = Flask(__name__)
+rdb = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
-# ─── TIME LOGGER ──────────────────────────────────────────────
 def log_time(label, start):
     end = time.time()
     print(f"{label}: {end - start:.2f}s")
 
-# ─── Geocode an address to lat/lng ─────────────────────────────
 def geocode(addr):
     start = time.time()
     j = requests.get(
@@ -38,7 +39,6 @@ def geocode(addr):
     log_time("📍 Geocode API", start)
     return {"lat": loc["lat"], "lng": loc["lng"]}
 
-# ─── Cluster orders spatially ──────────────────────────────────
 def cluster_orders(ords, eps_km=1.0, min_samples=1):
     coords = np.array([[o['lat'], o['lng']] for o in ords])
     labels = DBSCAN(eps=eps_km/111, min_samples=min_samples).fit(coords).labels_
@@ -48,7 +48,6 @@ def cluster_orders(ords, eps_km=1.0, min_samples=1):
         clusters.setdefault(lab, []).append(o)
     return list(clusters.values())
 
-# ─── Fetch time & distance with traffic ────────────────────────
 def fetch_matrix(nodes):
     start = time.time()
     coords = [f"{n['lat']},{n['lng']}" for n in nodes]
@@ -71,8 +70,11 @@ def fetch_matrix(nodes):
     log_time("🧭 Distance Matrix API", start)
     return t, d
 
-# ─── Get route polyline ────────────────────────────────────────
 def fetch_geometry(a, b):
+    key = f"geom:{a['lat']},{a['lng']}-{b['lat']},{b['lng']}"
+    if cached := rdb.get(key):
+        return json.loads(cached)
+
     start = time.time()
     res = requests.get(
         "https://maps.googleapis.com/maps/api/directions/json",
@@ -84,14 +86,15 @@ def fetch_geometry(a, b):
             "key": GOOGLE_API_KEY
         }
     ).json()
-    log_time("🛣️ Directions API", start)
-    return polyline.decode(res["routes"][0]["overview_polyline"]["points"])
+
+    pts = polyline.decode(res["routes"][0]["overview_polyline"]["points"])
+    rdb.setex(key, REDIS_TTL, json.dumps(pts))
+    log_time("🛣️ Directions API (with cache)", start)
+    return pts
 
 
 
-# ─── Sample AQI along route (Open-Meteo, Async Optimized) ──────────────────────────
 async def fetch_aqi(session, lat, lng):
-    t1 = time.time()
     async with session.get(
         "https://air-quality-api.open-meteo.com/v1/air-quality",
         params={
@@ -104,90 +107,49 @@ async def fetch_aqi(session, lat, lng):
         j = await resp.json()
         pm25 = j["hourly"]["pm2_5"][0]
         pm10 = j["hourly"]["pm10"][0]
-        log_time("🌫️ Open-Meteo AQI (one point)", t1)
         return (pm25 + pm10) / 2
 
-def sample_aqi(a, b, samples=5):
-    start = time.time()
-    # 1. Get full route geometry
-    pts = fetch_geometry(a, b)
+async def async_sample_aqi(a, b, samples=5):
+    key = f"aqi:{a['lat']},{a['lng']}-{b['lat']},{b['lng']}"
+    if cached := rdb.get(key):
+        return float(cached)
 
-    # 2. Pick up to `samples` evenly spaced points
+    start = time.time()
+    pts = fetch_geometry(a, b)
     step = max(1, len(pts) // samples)
     sample_pts = pts[0::step]
 
-    # 3. Async fetch all AQI readings concurrently
-    async def gather_aqi():
-        async with aiohttp.ClientSession() as session:
-            tasks = [fetch_aqi(session, lat, lng) for lat, lng in sample_pts]
-            return await asyncio.gather(*tasks)
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_aqi(session, lat, lng) for lat, lng in sample_pts]
+        vals = await asyncio.gather(*tasks)
 
-    vals = asyncio.run(gather_aqi())
+    avg = float(np.mean(vals))
+    rdb.setex(key, REDIS_TTL, avg)
+    log_time("🌫️ Sample AQI (async, cached)", start)
+    return avg
 
-    # 4. Log & return the mean
-    log_time("🌫️ Sample AQI (full, Open-Meteo, Async)", start)
-    return np.mean(vals)
-
-
-# def sample_aqi(a, b, samples=5):
-#     start = time.time()
-#     pts = fetch_geometry(a, b)
-#     step = max(1, len(pts)//samples)
-#     vals = []
-#     for lat, lng in pts[0::step]:
-#         t1 = time.time()
-#         j = requests.get(
-#             "http://api.openweathermap.org/data/2.5/air_pollution",
-#             params={"lat": lat, "lon": lng, "appid": OPENWEATHER_API_KEY}
-#         ).json()
-#         vals.append(j["list"][0]["main"]["aqi"])
-#         time.sleep(0.1)
-#         log_time("🌫️ AQI API (one point)", t1)
-#     log_time("🌫️ Sample AQI (full)", start)
-#     return np.mean(vals)
-
-
-
-
-# ─── Count sensitive POIs along route ──────────────────────────
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 def buffer_route(route_pts, buffer_m=100):
-    """
-    route_pts: list of (lat, lng)
-    buffer_m: buffer distance in meters
-    Returns a Shapely polygon (in WGS84) covering route ± buffer_m.
-    """
-    # 1) Build a lon/lat LineString
     line = LineString([(lng, lat) for lat, lng in route_pts])
-
-    # 2) Project to a local Azimuthal Equidistant CRS (meters)
     wgs84 = pyproj.CRS("EPSG:4326")
     aeqd  = pyproj.CRS.from_proj4(
         f"+proj=aeqd +lat_0={route_pts[0][0]} +lon_0={route_pts[0][1]} +units=m"
     )
     proj_to_aeqd = pyproj.Transformer.from_crs(wgs84, aeqd, always_xy=True).transform
     proj_to_wgs84 = pyproj.Transformer.from_crs(aeqd, wgs84, always_xy=True).transform
-
     line_m = transform(proj_to_aeqd, line)
     buff_m = line_m.buffer(buffer_m)
     return transform(proj_to_wgs84, buff_m)
 
 def count_zones_overpass(route_pts, buffer_m=100, types=None):
-    """
-    Counts unique POIs of given amenities within buffer_m meters of the route.
-    route_pts: list of (lat, lng)
-    types: list of OSM amenity tags (defaults to your 4 types)
-    """
     if types is None:
         types = ["school", "hospital", "shopping_mall", "place_of_worship"]
 
-    # 1) Build the buffer polygon
     poly = buffer_route(route_pts, buffer_m)
-    minx, miny, maxx, maxy = poly.bounds  # lon_min, lat_min, lon_max, lat_max
+    minx, miny, maxx, maxy = poly.bounds
 
-    # 2) Construct Overpass QL to fetch nodes/ways/rels in that bbox
     tag_filter = "".join(f'["amenity"="{t}"]' for t in types)
     query = f"""
       [out:json][timeout:25];
@@ -199,53 +161,31 @@ def count_zones_overpass(route_pts, buffer_m=100, types=None):
       out center;
     """
 
-    # 3) Send single Overpass request
     resp = requests.get(OVERPASS_URL, params={"data": query}).json()
 
-    # 4) Filter elements to those truly inside the buffer and dedupe
     seen = set()
     for el in resp.get("elements", []):
-        # pick a coordinate to test: node → (lat,lon); way/rel → center
         if el["type"] == "node":
             lat, lon = el["lat"], el["lon"]
         else:
             lat, lon = el["center"]["lat"], el["center"]["lon"]
-        # shapely Point expects (x=lon, y=lat)
         if poly.contains(Point(lon, lat)):
             seen.add((el["type"], el["id"]))
     return len(seen)
 
-def count_zones(a, b, samples=5):
-    # 1) get full route geometry
-    route_pts = fetch_geometry(a, b)
-    # 2) count POIs in buffer corridor (100 m each side)
+async def async_count_zones(a, b):
+    key = f"zones:{a['lat']},{a['lng']}-{b['lat']},{b['lng']}"
+    if cached := rdb.get(key):
+        return int(cached)
+
     start = time.time()
-    tot = count_zones_overpass(route_pts, buffer_m=100)
-    log_time("☣️ Overpass Sensitive Zone Scan", start)
-    return tot
+    route_pts = fetch_geometry(a, b)
+    total = count_zones_overpass(route_pts, buffer_m=100)
+    rdb.setex(key, REDIS_TTL, total)
+    log_time("☣️ Overpass Zone Count (async, cached)", start)
+    return total
 
 
-# def count_zones(a, b, samples=5):
-#     start = time.time()
-#     pts = fetch_geometry(a, b)
-#     step = max(1, len(pts)//samples)
-#     tot = 0
-#     for lat, lng in pts[0::step]:
-#         for t in ["school", "hospital", "shopping_mall", "place_of_worship"]:
-#             t1 = time.time()
-#             j = requests.get(
-#                 "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
-#                 params={"location": f"{lat},{lng}", "radius": 100, "type": t, "key": GOOGLE_API_KEY}
-#             ).json()
-#             tot += len(j.get("results", []))
-#             time.sleep(0.1)
-#             log_time(f"🏥 Places API ({t})", t1)
-#     log_time("☣️ Total Sensitive Zone Scan", start)
-#     return tot
-
-
-
-# ─── Build weighted cost matrix ────────────────────────────────
 def build_cost(t, d, aqi, zones, em):
     start = time.time()
     def norm(m):
@@ -256,7 +196,6 @@ def build_cost(t, d, aqi, zones, em):
     log_time("💰 Build Cost Matrix", start)
     return w["time"]*nt + w["aqi"]*na + w["zones"]*nz + w["emissions"]*ne
 
-# ─── Solve TSP. Please dont ask me , i dont know whats hapenning ─────
 def solve_tsp(cost):
     start = time.time()
     N = cost.shape[0]
@@ -277,60 +216,56 @@ def solve_tsp(cost):
     log_time("🧠 TSP Solve Time", start)
     return route
 
+async def compute_all_pairs(nodes):
+    N = len(nodes)
+    aqi_mat  = np.zeros((N, N))
+    zone_mat = np.zeros((N, N))
 
-# ─── API Endpoint ────────────────────────────────────────────────
+    sem = asyncio.Semaphore(5)  # Limit concurrency
+
+    async def compute(i, j):
+        if i == j: return
+        async with sem:
+            aqi = await async_sample_aqi(nodes[i], nodes[j])
+            zones = await async_count_zones(nodes[i], nodes[j])
+            aqi_mat[i][j] = aqi
+            zone_mat[i][j] = zones
+
+    await asyncio.gather(*(compute(i, j) for i in range(N) for j in range(N)))
+    return aqi_mat, zone_mat
+
+
 @app.route("/api/eco_route", methods=["POST"])
 def eco_route():
     total_start = time.time()
     data = request.json
 
-    src   = data["source"]           # dict {lat, lng}
-    dests = data["destinations"]     # list of dicts
+    src   = data["source"]
+    dests = data["destinations"]
     veh   = data.get("vehicle", "Petrol")
     emission_rate = EMISSION_RATES.get(veh, EMISSION_RATES["Petrol"])
 
-    # 2. Cluster destinations into spatial batches (min_samples=2 by default)
     clusters = cluster_orders(dests)
-    print("Clusters:", clusters)
+    if not clusters:
+        clusters = [dests]  # fallback
 
-    # 3. If no cluster (e.g. only 1 destination), just use all dests as a single batch
-    if clusters:
-        batch = clusters[0]
-    else:
-        batch = dests
+    all_routes = []
 
-    # 4. Build the list of nodes (depot + batch)
-    nodes = [src] + batch
+    for cluster in clusters:
+        nodes = [src] + cluster
 
-    # 5. Fetch real-time travel time & distance matrix
-    tmat, dmat = fetch_matrix(nodes)
+        tmat, dmat = fetch_matrix(nodes)
+        aqi_mat, zone_mat = asyncio.run(compute_all_pairs(nodes))
+        cost_mat = build_cost(tmat, dmat, aqi_mat, zone_mat, emission_rate)
+        visit_order = solve_tsp(cost_mat)
 
-    # 6. Sample AQI & count sensitive zones for each pair
-    N = len(nodes)
-    aqi_mat  = np.zeros((N, N))
-    zone_mat = np.zeros((N, N))
-    for i in range(N):
-        for j in range(N):
-            if i == j:
-                continue
-            aqi_mat[i, j]  = sample_aqi(nodes[i], nodes[j])
-            zone_mat[i, j] = count_zones(nodes[i], nodes[j])
-
-
-    # 7. Build composite cost matrix
-    cost_mat = build_cost(tmat, dmat, aqi_mat, zone_mat, emission_rate)
-
-    # 8. Solve the one‑vehicle TSP (returns a list of indices into `nodes`)
-    visit_order = solve_tsp(cost_mat)
-    print("Visit order:", visit_order)
-
-    # 9. Map indices back to lat/lng objects
-    route = [nodes[idx] for idx in visit_order]
+        optimized_route = [nodes[idx] for idx in visit_order]
+        all_routes.append(optimized_route)
 
     log_time("🚚 /api/eco_route Total Time", total_start)
-    return jsonify(route), 200
+    return jsonify(all_routes), 200
 
-# ─── Frontend ──────────────────────────────────────────────────────
+
 @app.route("/")
 def index():
     return render_template("index.html",
