@@ -1,5 +1,6 @@
 import os, time, requests, numpy as np, polyline, json
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, abort
+from statistics import mean
 from dotenv import load_dotenv
 from sklearn.cluster import DBSCAN
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
@@ -23,7 +24,8 @@ EMISSION_RATES = {"EV":0, "Petrol":120, "Diesel":180}
 WEIGHTS        = {"aqi":0.4, "zones":0.3, "emissions":0.2, "time":0.1}
 
 app = Flask(__name__)
-rdb = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+rdb = redis.Redis.from_url(os.environ["REDIS_URL"])
 
 def log_time(label, start):
     end = time.time()
@@ -264,6 +266,38 @@ def eco_route():
 
     log_time("🚚 /api/eco_route Total Time", total_start)
     return jsonify(all_routes), 200
+
+@app.route("/api/cluster_orders", methods=["POST"])
+def cluster_orders_route():
+    data = request.json
+    orders = data.get("orders", [])
+    if not orders:
+        return abort(400, "Missing 'orders' in request body.")
+
+    clusters = cluster_orders(orders)
+    return jsonify(clusters), 200
+
+
+@app.route("/api/find_nearest_store", methods=["POST"])
+def find_nearest_store_route():
+    data = request.json
+    cluster = data.get("cluster")
+    stores = data.get("stores")
+
+    if not cluster or not stores:
+        return abort(400, "Missing 'cluster' or 'stores' in request body.")
+
+    cluster_center = {
+        "lat": mean([p["lat"] for p in cluster]),
+        "lng": mean([p["lng"] for p in cluster])
+    }
+
+    # Haversine distance from cluster center to each store
+    nearest = min(stores, key=lambda s: haversine(
+        (cluster_center["lat"], cluster_center["lng"]),
+        (s["lat"], s["lng"])
+    ))
+    return jsonify(nearest), 200
 
 
 @app.route("/")
