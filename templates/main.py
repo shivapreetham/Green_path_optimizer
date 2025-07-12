@@ -2,23 +2,21 @@ import os
 import time
 import numpy as np
 import requests
-import polyline             # pip install polyline
+import polyline
 from sklearn.cluster import DBSCAN
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-
-# ─── CONFIG ────────────────────────────────────────────────────────────────────
+from dotenv import load_dotenv
+load_dotenv()
 
 GOOGLE_API_KEY      = os.getenv("GOOGLE_API_KEY")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
-# Emission rates (g CO₂ per km)
 EMISSION_RATES = {
     "EV":     0,
     "Petrol": 120,
     "Diesel": 180,
 }
 
-# Cost weights (must sum to 1.0)
 WEIGHTS = {
     "aqi":       0.4,
     "zones":     0.3,
@@ -26,9 +24,13 @@ WEIGHTS = {
     "time":      0.1,
 }
 
-# ─── 1) CLUSTER ORDERS ─────────────────────────────────────────────────────────
+# Logging helper
+def log_time(label, start_time):
+    print(f"{label} took {time.time() - start_time:.2f} seconds")
 
+# ─── 1) CLUSTER ORDERS ─────────────────────────────────────────────
 def cluster_orders(orders, eps_km=1.0, min_samples=2):
+    start = time.time()
     coords = np.array([[o['lat'], o['lng']] for o in orders])
     db = DBSCAN(eps=eps_km/111, min_samples=min_samples).fit(coords)
     labels = db.labels_
@@ -36,11 +38,13 @@ def cluster_orders(orders, eps_km=1.0, min_samples=2):
     for o, lab in zip(orders, labels):
         if lab < 0: continue
         clusters.setdefault(lab, []).append(o)
+    log_time("🧠 Clustering Orders", start)
+    print("Clusters:", list(clusters.values()))
     return list(clusters.values())
 
-# ─── 2) DISTANCE & TIME MATRIX ────────────────────────────────────────────────
-
+# ─── 2) DISTANCE & TIME MATRIX ─────────────────────────────────────
 def fetch_google_matrix(nodes):
+    start = time.time()
     coords = [f"{n['lat']},{n['lng']}" for n in nodes]
     params = {
         "origins":       "|".join(coords),
@@ -58,11 +62,12 @@ def fetch_google_matrix(nodes):
         for j, elem in enumerate(row['elements']):
             time_mat[i,j] = elem['duration_in_traffic']['value']
             dist_mat[i,j] = elem['distance']['value']
+    log_time("📏 Distance Matrix API", start)
     return time_mat, dist_mat
 
-# ─── 3) FETCH ROUTE GEOMETRY ──────────────────────────────────────────────────
-
+# ─── 3) FETCH ROUTE GEOMETRY ───────────────────────────────────────
 def fetch_route_geometry(orig, dest):
+    start = time.time()
     url = "https://maps.googleapis.com/maps/api/directions/json"
     params = {
         "origin":        f"{orig['lat']},{orig['lng']}",
@@ -74,10 +79,10 @@ def fetch_route_geometry(orig, dest):
     }
     res = requests.get(url, params=params).json()
     poly = res["routes"][0]["overview_polyline"]["points"]
+    log_time("🛣️ Directions API (fetch_geometry)", start)
     return polyline.decode(poly)
 
-# ─── 4) SAMPLE AQI ─────────────────────────────────────────────────────────────
-
+# ─── 4) SAMPLE AQI ─────────────────────────────────────────────────
 def sample_aqi_along_points(points):
     aqi_vals = []
     for lat, lng in points:
@@ -88,13 +93,15 @@ def sample_aqi_along_points(points):
     return np.mean(aqi_vals)
 
 def sample_aqi_for_pair(orig, dest, samples=5):
+    start = time.time()
     geom = fetch_route_geometry(orig, dest)
     step = max(1, len(geom)//samples)
     sample_pts = geom[0::step]
-    return sample_aqi_along_points(sample_pts)
+    aqi = sample_aqi_along_points(sample_pts)
+    log_time("🌫️ Sample AQI", start)
+    return aqi
 
-# ─── 5) COUNT SENSITIVE ZONES ───────────────────────────────────────────────────
-
+# ─── 5) COUNT SENSITIVE ZONES ──────────────────────────────────────
 def count_pois_near(lat, lng, radius_m=100, types=None):
     if types is None:
         types = ["school","hospital","shopping_mall","place_of_worship"]
@@ -112,14 +119,17 @@ def count_pois_near(lat, lng, radius_m=100, types=None):
     return total
 
 def count_zones_for_pair(orig, dest, samples=5):
+    start = time.time()
     geom = fetch_route_geometry(orig, dest)
     step = max(1, len(geom)//samples)
     sample_pts = geom[0::step]
-    return sum(count_pois_near(lat, lng) for lat, lng in sample_pts)
+    count = sum(count_pois_near(lat, lng) for lat, lng in sample_pts)
+    log_time("☣️ Count Sensitive Zones", start)
+    return count
 
-# ─── 6) BUILD COST MATRIX ─────────────────────────────────────────────────────
-
+# ─── 6) BUILD COST MATRIX ──────────────────────────────────────────
 def build_cost_matrix(time_mat, dist_mat, aqi_mat, zone_mat, emission_rate):
+    start = time.time()
     def normalize(m):
         mn, mx = np.nanmin(m), np.nanmax(m)
         return (m - mn) / (mx - mn + 1e-9)
@@ -128,11 +138,12 @@ def build_cost_matrix(time_mat, dist_mat, aqi_mat, zone_mat, emission_rate):
     nz = normalize(zone_mat)
     ne = normalize((dist_mat/1000) * emission_rate)
     w = WEIGHTS
+    log_time("🧮 Build Cost Matrix", start)
     return w['time']*nt + w['aqi']*na + w['zones']*nz + w['emissions']*ne
 
-# ─── 7) TSP SOLVER ──────────────────────────────────────────────────────────────
-
+# ─── 7) TSP SOLVER ─────────────────────────────────────────────────
 def solve_tsp(cost_matrix, return_to_depot=True):
+    start = time.time()
     N = cost_matrix.shape[0]
     mgr = pywrapcp.RoutingIndexManager(N, 1, 0)
     routing = pywrapcp.RoutingModel(mgr)
@@ -140,7 +151,6 @@ def solve_tsp(cost_matrix, return_to_depot=True):
         return int(cost_matrix[mgr.IndexToNode(i), mgr.IndexToNode(j)] * 1000)
     idx = routing.RegisterTransitCallback(cb)
     routing.SetArcCostEvaluatorOfAllVehicles(idx)
-    # If one-way, remove return leg:
     if not return_to_depot:
         routing.SetFixedCostOfAllVehicles(0)
         routing.AddDimension(idx, 0, 1, False, "NoReturn")
@@ -153,48 +163,44 @@ def solve_tsp(cost_matrix, return_to_depot=True):
         route.append(mgr.IndexToNode(index))
         index = sol.Value(routing.NextVar(index))
     route.append(mgr.IndexToNode(index))
+    log_time("📦 TSP Solve", start)
     return route
 
-# ─── 8) MAIN PLANNING FUNCTION ─────────────────────────────────────────────────
-
+# ─── 8) MAIN PLANNING FUNCTION ─────────────────────────────────────
 def plan_eco_batch(orders, depot, vehicle_type="Petrol"):
-    # 1. cluster and pick a batch
+    total_start = time.time()
     clusters = cluster_orders(orders)
     if not clusters:
         return []
     batch = clusters[0]
     nodes = [depot] + batch
 
-    # 2. time & distance
     time_mat, dist_mat = fetch_google_matrix(nodes)
 
-    # 3. AQI & zones
+    print("⚙️ Starting AQI + Zone matrix computation")
+    aqi_zone_start = time.time()
     N = len(nodes)
     aqi_mat  = np.zeros((N,N))
     zone_mat = np.zeros((N,N))
     for i in range(N):
         for j in range(N):
-            if i == j:
-                continue
+            if i == j: continue
             aqi_mat[i,j]  = sample_aqi_for_pair(nodes[i], nodes[j])
             zone_mat[i,j] = count_zones_for_pair(nodes[i], nodes[j])
+    log_time("📊 AQI + Zone matrix computed", aqi_zone_start)
 
-    # 4. cost matrix
     cost_mat = build_cost_matrix(
         time_mat, dist_mat, aqi_mat, zone_mat,
         EMISSION_RATES.get(vehicle_type, 0)
     )
 
-    # 5. solve TSP (depot → all → back to depot)
     order = solve_tsp(cost_mat, return_to_depot=True)
+    log_time("🚀 Total route optimization", total_start)
+    print("Visit order:", order)
     return [nodes[i] for i in order]
 
-# ─── 9) DEMO ───────────────────────────────────────────────────────────────────
-
+# ─── 9) DEMO ───────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Set your API keys before running, e.g.:
-    # export GOOGLE_API_KEY="..."
-    # export OPENWEATHER_API_KEY="..."
     depot = {"lat": 12.9716, "lng": 77.5946}
     orders = [
         {"order_id":1, "lat": 12.9721, "lng": 77.5950},
@@ -202,6 +208,6 @@ if __name__ == "__main__":
         {"order_id":3, "lat": 12.9698, "lng": 77.5961},
     ]
     route = plan_eco_batch(orders, depot, vehicle_type="Petrol")
-    print("Eco‑friendly delivery sequence:")
+    print("📍 Eco‑friendly delivery sequence:")
     for stop in route:
         print(stop)
