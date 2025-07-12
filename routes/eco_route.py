@@ -116,7 +116,7 @@ async def async_count_zones(a, b):
     key = f"zones:{a['lat']},{a['lng']}-{b['lat']},{b['lng']}"
     if cached := rdb.get(key): return int(cached)
     pts = fetch_geometry(a, b)
-    poly = LineString([(lng, lat) for lat, lng in pts]).buffer(0.01)
+    poly = LineString([(lng, lat) for lat, lng in pts]).buffer(0.0045)
     minx, miny, maxx, maxy = poly.bounds
     query = f"""
     [out:json][timeout:25];
@@ -169,6 +169,78 @@ def solve_tsp(cost):
     route.append(mgr.IndexToNode(cur))
     return route
 
+@log_duration("🪜 naive_nearest_neighbor")
+def naive_nearest_neighbor(dmat):
+    N = dmat.shape[0]
+    visited = [False] * N
+    path = [0]  # Start from warehouse
+    visited[0] = True
+
+    for _ in range(N - 1):
+        last = path[-1]
+        nearest = None
+        nearest_dist = float("inf")
+        for j in range(N):
+            if not visited[j] and dmat[last][j] < nearest_dist:
+                nearest = j
+                nearest_dist = dmat[last][j]
+        if nearest is not None:
+            path.append(nearest)
+            visited[nearest] = True
+
+    path.append(0)  # Return to warehouse
+    return path
+
+
+
+@log_duration("🪜 naive_round_trip_each_order")
+def naive_round_trip_each_order(src, dests, dmat, tmat):
+    path = []
+    order_ids = []
+    total_dist = 0
+    total_time = 0
+    steps = []
+
+    for i, dest in enumerate(dests):
+        # From warehouse to order
+        dist_to = dmat[0][i+1] / 1000
+        time_to = tmat[0][i+1]
+        # From order back to warehouse
+        dist_back = dmat[i+1][0] / 1000
+        time_back = tmat[i+1][0]
+
+        total_dist += dist_to + dist_back
+        total_time += time_to + time_back
+
+        # Forward step
+        steps.append({
+            "from": src,
+            "to": dest,
+            "fromOrderId": None,
+            "toOrderId": dest.get("orderId"),
+            "distanceKm": round(dist_to, 2),
+            "durationSec": int(time_to),
+            "polyline": fetch_geometry(src, dest)
+        })
+        # Return step
+        steps.append({
+            "from": dest,
+            "to": src,
+            "fromOrderId": dest.get("orderId"),
+            "toOrderId": None,
+            "distanceKm": round(dist_back, 2),
+            "durationSec": int(time_back),
+            "polyline": fetch_geometry(dest, src)
+        })
+
+        path.append(src)  # Starting point
+        path.append(dest)  # Destination
+        path.append(src)  # Return
+        order_ids.extend([None, dest.get("orderId"), None])
+
+    return path, order_ids, steps, total_dist, total_time
+
+
 @eco_route_bp.route("/api/eco_route", methods=["POST"])
 @log_duration("📦 /api/eco_route handler")
 def eco_route():
@@ -184,15 +256,11 @@ def eco_route():
     tmat, dmat = fetch_matrix(nodes)
     aqi_mat, zone_mat = asyncio.run(compute_all_pairs(nodes))
 
+    # 🌱 Eco route computation
     cost_eco = build_cost(tmat, dmat, aqi_mat, zone_mat, emission)
     order_eco = solve_tsp(cost_eco)
     route_eco = [nodes[i] for i in order_eco]
     route_order_ids = [order_ids[i] for i in order_eco]
-
-    cost_naive = build_cost(tmat, dmat, np.zeros_like(aqi_mat), np.zeros_like(zone_mat), 0)
-    order_naive = solve_tsp(cost_naive)
-    naive_distance_km = sum(dmat[order_naive[i]][order_naive[i+1]] for i in range(len(order_naive)-1)) / 1000
-    naive_duration_sec = sum(tmat[order_naive[i]][order_naive[i+1]] for i in range(len(order_naive)-1))
 
     steps = []
     total_dist = total_time = total_co2 = total_zones = 0
@@ -226,6 +294,38 @@ def eco_route():
         total_zones += zones
         total_aqi.append(aqi)
 
+    # 🚚 Naive round-trip route
+    # 🚚 Naive round-trip route
+    naive_path, naive_order_ids, naive_steps, naive_distance_km, naive_duration_sec = naive_round_trip_each_order(
+        src, dests, dmat, tmat
+    )
+
+    # ➕ Add AQI and Zone data to naive steps
+    async def enrich_naive_steps():
+        sem = asyncio.Semaphore(5)
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for step in naive_steps:
+                a = step["from"]
+                b = step["to"]
+                async def enrich_step(step=step, a=a, b=b):
+                    async with sem:
+                        try:
+                            aqi = await fetch_aqi(session, a["lat"], a["lng"])
+                            zones = await async_count_zones(a, b)
+                            step["aqi"] = round(aqi, 2)
+                            step["zoneCount"] = zones
+                        except Exception as e:
+                            step["aqi"] = 50.0
+                            step["zoneCount"] = 0
+                tasks.append(enrich_step())
+            await asyncio.gather(*tasks)
+
+    asyncio.run(enrich_naive_steps())
+
+    naive_co2 = naive_distance_km * emission
+    naive_zones = sum(step.get("zoneCount", 0) for step in naive_steps if "zoneCount" in step)
+
     avg_aqi = round(sum(total_aqi) / len(total_aqi), 2)
     aqi_rating = (
         "Good" if avg_aqi <= 50 else
@@ -234,20 +334,29 @@ def eco_route():
         "Very Unhealthy" if avg_aqi <= 200 else
         "Hazardous"
     )
-    trees_saved = round((naive_distance_km * emission - total_co2) / 1000000 / 21, 3)
 
-    return jsonify([{
-        "route": [[p["lat"], p["lng"]] for p in route_eco],
-        "stepOrderIds": route_order_ids,
-        "steps": steps,
-        "impactSummary": {
-            "totalCO2g": round(total_co2, 2),
-            "equivalentTrees": trees_saved,
-            "reducedIfEV": round(total_dist * EMISSION_RATES["Petrol"], 2),
-            "zonesPassed": int(total_zones),
-            "avgAQI": avg_aqi,
-            "AQIRating": aqi_rating
+    # 🔥 Final impact summary
+    impact_summary = {
+        "ecoCO2g": round(total_co2, 2),
+        "naiveCO2g": round(naive_co2, 2),
+        "ecoZones": int(total_zones),
+        "naiveZones": int(naive_zones),
+        "avgAQI": avg_aqi,
+        "AQIRating": aqi_rating
+    }
+
+    response_data = [{
+        "eco": {
+            "route": [[p["lat"], p["lng"]] for p in route_eco],
+            "stepOrderIds": route_order_ids,
+            "steps": steps
         },
+        "naive": {
+            "route": [[p["lat"], p["lng"]] for p in naive_path],
+            "stepOrderIds": naive_order_ids,
+            "steps": naive_steps
+        },
+        "impactSummary": impact_summary,
         "efficiency": {
             "optimizedVsUnoptimizedKm": {
                 "optimized": round(total_dist, 2),
@@ -268,4 +377,10 @@ def eco_route():
             "aqiProvider": "Open-Meteo",
             "mapsCreditsUsed": len(nodes)**2 + len(nodes)
         }
-    }]), 200
+    }]
+
+    # 🖨️ Console log for debugging
+    print("📊 Impact Summary:")
+    print(json.dumps(impact_summary, indent=2))
+
+    return jsonify(response_data), 200
