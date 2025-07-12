@@ -80,56 +80,63 @@
       renderedRoutes.forEach(r => r.setMap(null));
       renderedRoutes = [];
 
-      const resp = await fetch("{{ api_url }}", {
-        method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({
-          source: sourceCoord,
-          destinations: destCoords
-        })
-      });
-      const routes = await resp.json();
-      if (!routes.length) {
-        alert("No route found");
-        return;
-      }
-      //console.log(routes);
-      
-      const colors = ["#00aa00", "#1a73e8", "#ff6600", "#aa00ff", "#ff4444", "#008080"];
-
-      routes.forEach((route, routeIndex) => {
-        const waypts = route.slice(1, -1).map(p => ({
-          location: `${p.lat},${p.lng}`,
-          stopover: true
-        }));
-
-        const color = colors[routeIndex % colors.length];
-
-        new google.maps.DirectionsService().route({
-          origin: `${route[0].lat},${route[0].lng}`,
-          destination: `${route[route.length - 1].lat},${route[route.length - 1].lng}`,
-          waypoints: waypts,
-          travelMode: 'DRIVING',
-          optimizeWaypoints: false
-        }, (res, st) => {
-          if (st === "OK") {
-            const renderer = new google.maps.DirectionsRenderer({
-              map,
-              suppressMarkers: true,
-              preserveViewport: true,
-              polylineOptions: {
-                strokeColor: color,
-                strokeOpacity: 0.8,
-                strokeWeight: 5
-              }
-            });
-            renderer.setDirections(res);
-            renderedRoutes.push(renderer);
-          } else {
-            alert(`Route ${routeIndex + 1} failed: ` + st);
-          }
+      try {
+        const resp = await fetch("/api/eco_route", {
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({
+            source: sourceCoord,
+            destinations: destCoords
+          })
         });
-      });
+
+        if (!resp.ok) throw new Error("API call failed");
+
+        const routes = await resp.json();
+        if (!routes.length) {
+          alert("No route found");
+          return;
+        }
+
+        const colors = ["#00aa00", "#1a73e8", "#ff6600", "#aa00ff", "#ff4444", "#008080"];
+
+        routes.forEach((route, routeIndex) => {
+          const waypts = route.slice(1, -1).map(p => ({
+            location: `${p.lat},${p.lng}`,
+            stopover: true
+          }));
+
+          const color = colors[routeIndex % colors.length];
+
+          new google.maps.DirectionsService().route({
+            origin: `${route[0].lat},${route[0].lng}`,
+            destination: `${route[route.length - 1].lat},${route[route.length - 1].lng}`,
+            waypoints: waypts,
+            travelMode: 'DRIVING',
+            optimizeWaypoints: false
+          }, (res, st) => {
+            if (st === "OK") {
+              const renderer = new google.maps.DirectionsRenderer({
+                map,
+                suppressMarkers: true,
+                preserveViewport: true,
+                polylineOptions: {
+                  strokeColor: color,
+                  strokeOpacity: 0.8,
+                  strokeWeight: 5
+                }
+              });
+              renderer.setDirections(res);
+              renderedRoutes.push(renderer);
+            } else {
+              alert(`Route ${routeIndex + 1} failed: ` + st);
+            }
+          });
+        });
+      } catch (e) {
+        alert("Failed to calculate route.");
+        console.error(e);
+      }
     });
 
   </script>
